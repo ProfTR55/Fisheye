@@ -26,6 +26,13 @@ class OptimizeConfig:
     start_tangential_jitter: float = 0.02
     random_seed: int = 13
     verbose: int = 2
+    use_projection_priors: bool = True
+    projection_prior_families: Tuple[str, ...] = (
+        "equidistant",
+        "equisolid",
+        "stereographic",
+    )
+    projection_prior_half_angles_deg: Tuple[float, ...] = (95.0, 110.0, 125.0)
 
 
 @dataclass
@@ -37,7 +44,8 @@ class CalibrationResult:
     history: List[Dict[str, float]] = field(default_factory=list)
     line_groups_used: List[np.ndarray] = field(default_factory=list)
     debug_lines: List[Dict[str, np.ndarray]] = field(default_factory=list)
-    start_summaries: List[Dict[str, float]] = field(default_factory=list)
+    start_summaries: List[Dict[str, object]] = field(default_factory=list)
+    best_init_label: str = ""
 
 
 def _build_bounds(image_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
@@ -75,58 +83,118 @@ def _build_bounds(image_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]
     return lower, upper
 
 
+def _projection_theta_samples(
+    family: str, half_angle_rad: float, num_samples: int = 64
+) -> np.ndarray:
+    """Sample theta(r_hat) for a physical fisheye projection family on r_hat in [0, 1].
+
+    All families are normalized so that theta(1) = half_angle_rad, matching how
+    the poly4 model interprets the unit-radius edge of the image.
+    """
+    r = np.linspace(0.0, 1.0, num_samples)
+    family = family.lower()
+    if family == "equidistant":
+        # theta = k * r, with k chosen so theta(1) = half_angle.
+        return half_angle_rad * r
+    if family == "equisolid":
+        # r ∝ sin(theta/2). Invert: theta = 2 * arcsin(r * sin(half_angle/2)).
+        s = np.sin(0.5 * half_angle_rad)
+        return 2.0 * np.arcsin(np.clip(r * s, -1.0, 1.0))
+    if family == "stereographic":
+        # r ∝ tan(theta/2). Invert: theta = 2 * arctan(r * tan(half_angle/2)).
+        t = np.tan(0.5 * half_angle_rad)
+        return 2.0 * np.arctan(r * t)
+    if family == "orthographic":
+        # r ∝ sin(theta). Invert: theta = arcsin(r * sin(half_angle)).
+        s = np.sin(min(half_angle_rad, 0.5 * np.pi - 1e-3))
+        return np.arcsin(np.clip(r * s, -1.0, 1.0))
+    raise ValueError(f"Unknown projection family: {family}")
+
+
+def _fit_poly4_to_theta(theta_samples: np.ndarray) -> np.ndarray:
+    """Least-squares fit of theta(r) = a1 r + a2 r^2 + a3 r^3 + a4 r^4."""
+    n = theta_samples.shape[0]
+    r = np.linspace(0.0, 1.0, n)
+    # Drop r=0 (theta=0) to avoid trivial constraint and improve conditioning.
+    mask = r > 0.0
+    A = np.stack([r[mask], r[mask] ** 2, r[mask] ** 3, r[mask] ** 4], axis=1)
+    b = theta_samples[mask]
+    coeffs, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return coeffs.astype(np.float64)
+
+
 def _generate_initial_parameters(
     image_shape: Tuple[int, int],
     optimize_cfg: OptimizeConfig,
     bounds: Tuple[np.ndarray, np.ndarray],
-) -> List[np.ndarray]:
-    """Generate randomized-but-bounded initial states for multi-start solving."""
+) -> List[Tuple[np.ndarray, str]]:
+    """Generate initial states for multi-start solving.
+
+    Returns a list of (parameter_vector, label) pairs. The label identifies the
+    initialization family for diagnostic reporting.
+    """
     h, w = image_shape[:2]
     lower, upper = bounds
-    n = max(1, int(optimize_cfg.multi_start))
+    cx0 = 0.5 * (w - 1)
+    cy0 = 0.5 * (h - 1)
     rng = np.random.default_rng(optimize_cfg.random_seed)
-    init_list: List[np.ndarray] = []
-    for k in range(n):
-        if k == 0:
-            half_angle = optimize_cfg.init_half_angle_deg
-            cx_jitter = 0.0
-            cy_jitter = 0.0
-            sx = 1.0
-            sy = 1.0
-            p1 = 0.0
-            p2 = 0.0
-        else:
-            half_angle = optimize_cfg.init_half_angle_deg + rng.uniform(
-                -optimize_cfg.start_half_angle_span_deg,
-                optimize_cfg.start_half_angle_span_deg,
-            )
-            half_angle = float(np.clip(half_angle, 65.0, 145.0))
-            cx_jitter = rng.normal(scale=optimize_cfg.start_center_jitter_frac * w)
-            cy_jitter = rng.normal(scale=optimize_cfg.start_center_jitter_frac * h)
-            sx = 1.0 + rng.uniform(
-                -optimize_cfg.start_anisotropy_jitter, optimize_cfg.start_anisotropy_jitter
-            )
-            sy = 1.0 + rng.uniform(
-                -optimize_cfg.start_anisotropy_jitter, optimize_cfg.start_anisotropy_jitter
-            )
-            p1 = rng.uniform(
-                -optimize_cfg.start_tangential_jitter, optimize_cfg.start_tangential_jitter
-            )
-            p2 = rng.uniform(
-                -optimize_cfg.start_tangential_jitter, optimize_cfg.start_tangential_jitter
-            )
-        model = FisheyePoly4Model.initial_from_shape(
-            image_shape=image_shape, max_half_angle_deg=half_angle
+    init_list: List[Tuple[np.ndarray, str]] = []
+
+    def _push(coeffs: np.ndarray, cx: float, cy: float, sx: float, sy: float,
+              p1: float, p2: float, label: str) -> None:
+        vec = np.array(
+            [cx, cy, *coeffs.tolist(), sx, sy, p1, p2], dtype=np.float64
         )
-        model.cx += cx_jitter
-        model.cy += cy_jitter
-        model.sx = float(sx)
-        model.sy = float(sy)
-        model.p1 = float(p1)
-        model.p2 = float(p2)
-        vec = model.to_vector()
         vec = np.clip(vec, lower + 1e-6, upper - 1e-6)
-        init_list.append(vec)
+        init_list.append((vec, label))
+
+    # Linear (poly4 with a1=theta_max only) baseline anchor — same as legacy default.
+    base_half_angle = float(optimize_cfg.init_half_angle_deg)
+    base_coeffs = np.array(
+        [np.deg2rad(base_half_angle), 0.0, 0.0, 0.0], dtype=np.float64
+    )
+    _push(base_coeffs, cx0, cy0, 1.0, 1.0, 0.0, 0.0, label="linear_baseline")
+
+    # Physical projection priors — anchor the search near plausible fisheye shapes.
+    if optimize_cfg.use_projection_priors:
+        for family in optimize_cfg.projection_prior_families:
+            for half_deg in optimize_cfg.projection_prior_half_angles_deg:
+                half_rad = np.deg2rad(float(half_deg))
+                try:
+                    theta = _projection_theta_samples(family, half_rad)
+                    coeffs = _fit_poly4_to_theta(theta)
+                except (ValueError, np.linalg.LinAlgError):
+                    continue
+                _push(
+                    coeffs, cx0, cy0, 1.0, 1.0, 0.0, 0.0,
+                    label=f"{family}_{int(round(half_deg))}deg",
+                )
+
+    # Randomized starts for additional diversity.
+    n_random = max(0, int(optimize_cfg.multi_start) - 1)
+    for k in range(n_random):
+        half_angle = optimize_cfg.init_half_angle_deg + rng.uniform(
+            -optimize_cfg.start_half_angle_span_deg,
+            optimize_cfg.start_half_angle_span_deg,
+        )
+        half_angle = float(np.clip(half_angle, 65.0, 145.0))
+        coeffs = np.array([np.deg2rad(half_angle), 0.0, 0.0, 0.0], dtype=np.float64)
+        cx = cx0 + rng.normal(scale=optimize_cfg.start_center_jitter_frac * w)
+        cy = cy0 + rng.normal(scale=optimize_cfg.start_center_jitter_frac * h)
+        sx = 1.0 + rng.uniform(
+            -optimize_cfg.start_anisotropy_jitter, optimize_cfg.start_anisotropy_jitter
+        )
+        sy = 1.0 + rng.uniform(
+            -optimize_cfg.start_anisotropy_jitter, optimize_cfg.start_anisotropy_jitter
+        )
+        p1 = rng.uniform(
+            -optimize_cfg.start_tangential_jitter, optimize_cfg.start_tangential_jitter
+        )
+        p2 = rng.uniform(
+            -optimize_cfg.start_tangential_jitter, optimize_cfg.start_tangential_jitter
+        )
+        _push(coeffs, cx, cy, sx, sy, p1, p2, label=f"random_{k}")
+
     return init_list
 
 
@@ -173,7 +241,7 @@ def calibrate_from_lines(
     best_objective = np.inf
     start_summaries: List[Dict[str, float]] = []
 
-    for start_id, init_params in enumerate(init_params_list):
+    for start_id, (init_params, init_label) in enumerate(init_params_list):
         params = init_params.copy()
         history: List[Dict[str, float]] = []
         current_lines = [line.copy() for line in base_lines]
@@ -218,6 +286,7 @@ def calibrate_from_lines(
         )
         start_summary = {
             "start_id": float(start_id),
+            "init_label": init_label,
             "objective": float(final_metrics["objective"]),
             "line_rmse": float(final_metrics["line_rmse"]),
             "total_rmse": float(final_metrics["total_rmse"]),
@@ -241,6 +310,7 @@ def calibrate_from_lines(
                 line_groups_used=current_lines,
                 debug_lines=final_debug_lines,
                 start_summaries=start_summaries.copy(),
+                best_init_label=init_label,
             )
 
     if best_result is None:
