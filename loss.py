@@ -31,6 +31,9 @@ class LossConfig:
     edge_weight_max: float = 4.0
     line_span_weight_alpha: float = 0.8
     line_span_weight_power: float = 1.0
+    normalize_line_residuals: bool = False
+    spatial_balance_grid_size: int = 4
+    spatial_balance_strength: float = 0.0
 
 
 def fit_2d_line_pca(points_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -43,6 +46,38 @@ def fit_2d_line_pca(points_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.n
     normal = np.array([-direction[1], direction[0]], dtype=np.float64)
     signed_dist = centered @ normal
     return center, direction, signed_dist
+
+
+def _spatial_balance_weights(
+    line_groups: List[np.ndarray], image_shape: Tuple[int, int], cfg: LossConfig
+) -> List[float]:
+    grid = max(1, int(cfg.spatial_balance_grid_size))
+    strength = max(0.0, float(cfg.spatial_balance_strength))
+    if grid <= 1 or strength <= 0.0:
+        return [1.0 for _ in line_groups]
+
+    h, w = image_shape[:2]
+    cells: List[Tuple[int, int] | None] = []
+    counts: Dict[Tuple[int, int], int] = {}
+    for line_pts in line_groups:
+        pts = np.asarray(line_pts, dtype=np.float64).reshape(-1, 2)
+        if pts.shape[0] < cfg.min_points_per_line:
+            cells.append(None)
+            continue
+        center = np.mean(pts, axis=0)
+        gx = int(np.clip(np.floor(center[0] / max(w, 1) * grid), 0, grid - 1))
+        gy = int(np.clip(np.floor(center[1] / max(h, 1) * grid), 0, grid - 1))
+        cell = (gx, gy)
+        cells.append(cell)
+        counts[cell] = counts.get(cell, 0) + 1
+
+    weights: List[float] = []
+    for cell in cells:
+        if cell is None:
+            weights.append(1.0)
+        else:
+            weights.append(float(counts[cell]) ** (-strength))
+    return weights
 
 
 def straightness_residuals(
@@ -59,7 +94,9 @@ def straightness_residuals(
 
     static_kept_lines = 0
     static_kept_points = 0
-    for line_pts in line_groups:
+    raw_distances: List[np.ndarray] = []
+    spatial_weights = _spatial_balance_weights(line_groups, image_shape, cfg)
+    for line_idx, line_pts in enumerate(line_groups):
         pts = np.asarray(line_pts, dtype=np.float64).reshape(-1, 2)
         if pts.shape[0] < cfg.min_points_per_line:
             continue
@@ -73,6 +110,7 @@ def straightness_residuals(
         line_weight = 1.0 + cfg.line_span_weight_alpha * (
             radial_span**cfg.line_span_weight_power
         )
+        line_weight *= spatial_weights[line_idx]
         total_weight = point_weight * line_weight
 
         rect_pts, valid = model.image_points_to_rectified(pts, image_shape=image_shape)
@@ -84,7 +122,10 @@ def straightness_residuals(
             signed_dist_all = (rect_pts - center) @ normal
             signed_dist_all[~valid] = cfg.invalid_point_penalty
             weighted = np.sqrt(total_weight) * signed_dist_all
+            if cfg.normalize_line_residuals:
+                weighted = weighted / np.sqrt(max(1, pts.shape[0]))
             residuals.append(weighted)
+            raw_distances.append(signed_dist_all[valid])
             accepted_lines += 1
             accepted_points += rect_valid.shape[0]
             debug_lines.append(
@@ -95,14 +136,18 @@ def straightness_residuals(
                     "rect_direction": direction,
                     "rect_distances": signed_dist_all[valid],
                     "weights": total_weight[valid],
+                    "spatial_weight": np.array([spatial_weights[line_idx]], dtype=np.float64),
                 }
             )
         else:
             # Keep residual length constant for least-squares stability.
-            residuals.append(
+            invalid_residual = (
                 np.sqrt(total_weight)
                 * np.full(pts.shape[0], cfg.invalid_point_penalty, dtype=np.float64)
             )
+            if cfg.normalize_line_residuals:
+                invalid_residual = invalid_residual / np.sqrt(max(1, pts.shape[0]))
+            residuals.append(invalid_residual)
 
     if not residuals:
         # Force optimizer away from degenerate/no-line states.
@@ -110,12 +155,16 @@ def straightness_residuals(
     else:
         residual = np.concatenate(residuals, axis=0)
 
+    raw_concat = np.concatenate(raw_distances, axis=0) if raw_distances else residual
     metrics = {
         "accepted_lines": float(accepted_lines),
         "accepted_points": float(accepted_points),
         "static_kept_lines": float(static_kept_lines),
         "static_kept_points": float(static_kept_points),
         "straight_rmse": float(np.sqrt(np.mean(residual**2))),
+        "raw_line_rmse": float(np.sqrt(np.mean(raw_concat**2))),
+        "raw_line_mae": float(np.mean(np.abs(raw_concat))),
+        "raw_line_p95": float(np.percentile(np.abs(raw_concat), 95)),
     }
     return residual, metrics, debug_lines
 
