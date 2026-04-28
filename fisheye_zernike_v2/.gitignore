@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+debug*/
+*_smoke.jpg
+out*.jpg
+compare*.jpg
+manual*.json
+rectified*.jpg
+runs/
+map_x.npy
+map_y.npy
