@@ -211,3 +211,6 @@ outputs/
 archive/cache/
 __pycache__/
 *.py[cod]
+
+# Build artifacts
+paper.zip
