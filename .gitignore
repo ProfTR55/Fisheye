@@ -225,3 +225,5 @@ fisheye_zernike_v2/experiments/
 pdfpages/
 paper.zip
 archive/
+fisheye_zernike_v2/run_paired_eval.py
+fisheye_zernike_v2/fisheye_zernike/paired_eval.py
