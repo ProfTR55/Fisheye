@@ -214,3 +214,13 @@ __pycache__/
 
 # Build artifacts
 paper.zip
+
+# Private — unpublished academic work (do NOT push before publication)
+paper/
+DURUM_RAPORU.md
+data/raw/
+data/annotations/
+data/DATASET.md
+fisheye_zernike_v2/experiments/
+pdfpages/
+paper.zip
