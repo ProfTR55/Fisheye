@@ -11,11 +11,13 @@ import numpy as np
 
 
 EPS = 1e-9
-SUPPORTED_MODELS = ("zernike4", "zernike6", "poly4")
+SUPPORTED_MODELS = ("zernike2", "zernike4", "zernike6", "poly4")
 
 
 def zernike_orders_for_family(family: str) -> Tuple[int, ...]:
     family = family.lower()
+    if family == "zernike2":
+        return (1, 3)
     if family == "zernike4":
         return (1, 3, 5, 7)
     if family == "zernike6":
@@ -27,7 +29,7 @@ def coefficient_count(family: str) -> int:
     family = family.lower()
     if family == "poly4":
         return 4
-    if family in ("zernike4", "zernike6"):
+    if family in ("zernike2", "zernike4", "zernike6"):
         return len(zernike_orders_for_family(family))
     raise ValueError(f"Unsupported model family: {family}")
 
