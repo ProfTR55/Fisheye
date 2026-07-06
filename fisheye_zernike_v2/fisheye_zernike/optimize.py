@@ -29,6 +29,7 @@ class OptimizeConfig:
     use_projection_priors: bool = False
     projection_prior_families: Tuple[str, ...] = ("equidistant", "equisolid", "stereographic")
     projection_prior_half_angles_deg: Tuple[float, ...] = (95.0, 110.0, 125.0)
+    enable_tangential: bool = True
 
 
 @dataclass
@@ -44,15 +45,18 @@ class CalibrationResult:
     best_init_label: str = ""
 
 
-def _build_bounds(family: str, image_shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+def _build_bounds(
+    family: str, image_shape: Tuple[int, int], enable_tangential: bool = True
+) -> Tuple[np.ndarray, np.ndarray]:
     h, w = image_shape[:2]
     n = coefficient_count(family)
+    tang = 0.18 if enable_tangential else 1e-6
     lower = np.array(
-        [-0.15 * w, -0.15 * h, 0.05, *([-6.0] * (n - 1)), 0.65, 0.65, -0.18, -0.18],
+        [-0.15 * w, -0.15 * h, 0.05, *([-6.0] * (n - 1)), 0.65, 0.65, -tang, -tang],
         dtype=np.float64,
     )
     upper = np.array(
-        [1.15 * w, 1.15 * h, 6.0, *([6.0] * (n - 1)), 1.45, 1.45, 0.18, 0.18],
+        [1.15 * w, 1.15 * h, 6.0, *([6.0] * (n - 1)), 1.45, 1.45, tang, tang],
         dtype=np.float64,
     )
     return lower, upper
@@ -162,7 +166,7 @@ def calibrate_from_lines(
     model_family = model_family.lower()
     optimize_cfg = optimize_cfg or OptimizeConfig()
     loss_cfg = loss_cfg or LossConfig()
-    bounds = _build_bounds(model_family, image_shape)
+    bounds = _build_bounds(model_family, image_shape, optimize_cfg.enable_tangential)
     starts = _generate_initial_parameters(model_family, image_shape, optimize_cfg, bounds)
     rounds = max(1, int(optimize_cfg.alternating_rounds))
     per_round_iters = max(30, int(np.ceil(optimize_cfg.max_iters / rounds)))
